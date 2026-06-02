@@ -11,7 +11,6 @@
 #include <math.h>
 #include <dlfcn.h>
 #include "ngx_js.h"
-#include "ngx_js_http.h"
 
 
 typedef struct {
@@ -3522,6 +3521,15 @@ ngx_js_build_proxy_auth_header(ngx_pool_t *pool, ngx_str_t *auth_header,
 
     ngx_encode_base64(&b64, &userpass);
 
+#if (NJS_USE_NGINX_HTTP_CLIENT)
+    len = sizeof("Basic ") - 1 + b64.len;
+    p = ngx_pnalloc(pool, len);
+    if (p == NULL) {
+        return NGX_ERROR;
+    }
+
+    ngx_sprintf(p, "Basic %V", &b64);
+#else
     len = sizeof("Proxy-Authorization: Basic \r\n") - 1 + b64.len;
     p = ngx_pnalloc(pool, len);
     if (p == NULL) {
@@ -3529,6 +3537,7 @@ ngx_js_build_proxy_auth_header(ngx_pool_t *pool, ngx_str_t *auth_header,
     }
 
     ngx_sprintf(p, "Proxy-Authorization: Basic %V\r\n", &b64);
+#endif
     auth_header->data = p;
     auth_header->len = len;
 
@@ -4387,10 +4396,17 @@ ngx_js_create_conf(ngx_conf_t *cf, size_t size)
     conf->max_response_body_size = NGX_CONF_UNSET_SIZE;
     conf->timeout = NGX_CONF_UNSET_MSEC;
 
+#if (NJS_USE_NGINX_HTTP_CLIENT)
+    conf->fetch_client_conf.keepalive = NGX_CONF_UNSET_UINT;
+    conf->fetch_client_conf.keepalive_requests = NGX_CONF_UNSET_UINT;
+    conf->fetch_client_conf.keepalive_time = NGX_CONF_UNSET_MSEC;
+    conf->fetch_client_conf.keepalive_timeout = NGX_CONF_UNSET_MSEC;
+#else
     conf->fetch_keepalive = NGX_CONF_UNSET_UINT;
     conf->fetch_keepalive_requests = NGX_CONF_UNSET_UINT;
     conf->fetch_keepalive_time = NGX_CONF_UNSET_MSEC;
     conf->fetch_keepalive_timeout = NGX_CONF_UNSET_MSEC;
+#endif
     conf->fetch_proxy_url = NGX_CONF_UNSET_PTR;
     conf->eval_proxy_url = NGX_CONF_UNSET_PTR;
 
@@ -4502,6 +4518,30 @@ ngx_js_merge_conf(ngx_conf_t *cf, void *parent, void *child,
     ngx_conf_merge_size_value(conf->max_response_body_size,
                               prev->max_response_body_size, 1048576);
 
+#if (NJS_USE_NGINX_HTTP_CLIENT)
+    ngx_conf_merge_uint_value(conf->fetch_client_conf.keepalive,
+                              prev->fetch_client_conf.keepalive, 0);
+    ngx_conf_merge_uint_value(conf->fetch_client_conf.keepalive_requests,
+                              prev->fetch_client_conf.keepalive_requests, 1000);
+    ngx_conf_merge_msec_value(conf->fetch_client_conf.keepalive_time,
+                              prev->fetch_client_conf.keepalive_time, 3600000);
+    ngx_conf_merge_msec_value(conf->fetch_client_conf.keepalive_timeout,
+                              prev->fetch_client_conf.keepalive_timeout, 60000);
+    conf->fetch_client_conf.keepalive_cache =
+        ngx_palloc(cf->pool, sizeof(ngx_queue_t));
+    if (conf->fetch_client_conf.keepalive_cache == NULL) {
+        return NGX_CONF_ERROR;
+    }
+
+    conf->fetch_client_conf.keepalive_free =
+        ngx_palloc(cf->pool, sizeof(ngx_queue_t));
+    if (conf->fetch_client_conf.keepalive_free == NULL) {
+        return NGX_CONF_ERROR;
+    }
+
+    ngx_queue_init(conf->fetch_client_conf.keepalive_cache);
+    ngx_queue_init(conf->fetch_client_conf.keepalive_free);
+#else
     ngx_conf_merge_uint_value(conf->fetch_keepalive, prev->fetch_keepalive, 0);
     ngx_conf_merge_uint_value(conf->fetch_keepalive_requests,
                               prev->fetch_keepalive_requests, 1000);
@@ -4511,6 +4551,7 @@ ngx_js_merge_conf(ngx_conf_t *cf, void *parent, void *child,
                               prev->fetch_keepalive_timeout, 60000);
     ngx_queue_init(&conf->fetch_keepalive_cache);
     ngx_queue_init(&conf->fetch_keepalive_free);
+#endif
 
     ngx_conf_merge_ptr_value(conf->fetch_proxy_url, prev->fetch_proxy_url,
                              NULL);

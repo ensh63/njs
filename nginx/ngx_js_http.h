@@ -11,38 +11,42 @@
 #define _NGX_JS_HTTP_H_INCLUDED_
 
 
+#if (NJS_USE_NGINX_HTTP_CLIENT)
+
+/*
+ * When ngx_http_client is available, redirect utility names to the
+ * ngx_http_client equivalents so that shared code (request constructor,
+ * header validation, etc.) uses the client library functions directly.
+ */
+
+#define NGX_JS_HOST_MAX_LEN                    NGX_HTTP_CLIENT_HOST_MAX_LEN
+#define NGX_JS_HTTP_DEFAULT_PORT               NGX_HTTP_CLIENT_DEFAULT_PORT
+#define NGX_JS_HTTPS_DEFAULT_PORT              NGX_HTTP_CLIENT_DEFAULT_SSL_PORT
+#define ngx_js_https                           ngx_http_client_is_https
+
+#define ngx_js_http_trim                       ngx_http_client_trim
+#define ngx_js_http_trim_ows                   ngx_http_client_trim_ows
+#define ngx_js_check_header_name               ngx_http_client_check_header_name
+#define ngx_js_check_header_value              ngx_http_client_check_header_value
+#define ngx_js_check_request_line_component                                   \
+    ngx_http_client_check_request_line_component
+
+#else
+
 #define NGX_JS_HOST_MAX_LEN        256
 #define NGX_JS_HTTP_DEFAULT_PORT   80
 #define NGX_JS_HTTPS_DEFAULT_PORT  443
 
 #define ngx_js_https(u) ((u)->default_port == NGX_JS_HTTPS_DEFAULT_PORT)
 
+void ngx_js_http_trim(u_char **value, size_t *len,
+    int trim_c0_control_or_space);
+void ngx_js_http_trim_ows(u_char **value, size_t *len);
+ngx_int_t ngx_js_check_header_name(u_char *name, size_t len);
+ngx_int_t ngx_js_check_request_line_component(u_char *value, size_t len);
+ngx_int_t ngx_js_check_header_value(u_char *value, size_t len);
 
-typedef struct ngx_js_http_s  ngx_js_http_t;
-
-typedef struct {
-    ngx_uint_t                     state;
-    unsigned                       http_major:16;
-    unsigned                       http_minor:16;
-    ngx_uint_t                     http_version;
-    ngx_uint_t                     code;
-    u_char                        *status_text;
-    u_char                        *status_text_end;
-    ngx_uint_t                     count;
-
-    u_char                        *header_name_start;
-    u_char                        *header_name_end;
-    u_char                        *header_start;
-    u_char                        *header_end;
-} ngx_js_http_parse_t;
-
-
-typedef struct {
-    u_char                        *pos;
-    uint64_t                       chunk_size;
-    uint8_t                        state;
-    uint8_t                        last;
-} ngx_js_http_chunk_parse_t;
+#endif
 
 
 typedef struct ngx_js_tb_elt_s  ngx_js_tb_elt_t;
@@ -107,6 +111,38 @@ typedef struct {
     ngx_js_headers_t               headers;
     njs_opaque_value_t             header_value;
 } ngx_js_response_t;
+
+
+ngx_buf_t *ngx_js_chain_to_buf(ngx_pool_t *pool, njs_chb_t *chain);
+
+
+#if !(NJS_USE_NGINX_HTTP_CLIENT)
+
+typedef struct ngx_js_http_s  ngx_js_http_t;
+
+typedef struct {
+    ngx_uint_t                     state;
+    unsigned                       http_major:16;
+    unsigned                       http_minor:16;
+    ngx_uint_t                     http_version;
+    ngx_uint_t                     code;
+    u_char                        *status_text;
+    u_char                        *status_text_end;
+    ngx_uint_t                     count;
+
+    u_char                        *header_name_start;
+    u_char                        *header_name_end;
+    u_char                        *header_start;
+    u_char                        *header_end;
+} ngx_js_http_parse_t;
+
+
+typedef struct {
+    u_char                        *pos;
+    uint64_t                       chunk_size;
+    uint8_t                        state;
+    uint8_t                        last;
+} ngx_js_http_chunk_parse_t;
 
 
 struct ngx_js_http_s {
@@ -178,17 +214,11 @@ ngx_resolver_ctx_t *ngx_js_http_resolve(ngx_js_http_t *http, ngx_resolver_t *r,
 void ngx_js_http_connect(ngx_js_http_t *http);
 void ngx_js_http_resolve_done(ngx_js_http_t *http);
 void ngx_js_http_close_peer(ngx_js_http_t *http);
-void ngx_js_http_trim(u_char **value, size_t *len,
-    int trim_c0_control_or_space);
-void ngx_js_http_trim_ows(u_char **value, size_t *len);
-ngx_int_t ngx_js_check_header_name(u_char *name, size_t len);
-ngx_int_t ngx_js_check_request_line_component(u_char *value, size_t len);
-ngx_int_t ngx_js_check_header_value(u_char *value, size_t len);
-
-ngx_buf_t *ngx_js_chain_to_buf(ngx_pool_t *pool, njs_chb_t *chain);
 
 void ngx_js_fetch_build_request(ngx_js_http_t *http, ngx_js_request_t *request,
     ngx_str_t *path, ngx_url_t *u, njs_bool_t is_proxy);
+
+#endif /* !(NJS_USE_NGINX_HTTP_CLIENT) */
 
 
 #endif /* _NGX_JS_HTTP_H_INCLUDED_ */

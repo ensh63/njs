@@ -18,7 +18,17 @@ typedef struct {
 
 
 typedef struct {
+#if (NJS_USE_NGINX_HTTP_CLIENT)
+    ngx_http_client_t             *client;
+    ngx_http_client_conf_t         conf;
+
+    ngx_pool_t                    *pool;
+    ngx_log_t                     *log;
+
+    ngx_js_response_t              response;
+#else
     ngx_js_http_t                  http;
+#endif
 
     njs_vm_t                      *vm;
     ngx_js_event_t                *event;
@@ -37,7 +47,11 @@ static njs_int_t ngx_js_headers_fill(njs_vm_t *vm, ngx_js_headers_t *headers,
     njs_value_t *init);
 static ngx_js_fetch_t *ngx_js_fetch_alloc(njs_vm_t *vm, ngx_pool_t *pool,
     ngx_log_t *log, ngx_js_loc_conf_t *conf);
+#if (NJS_USE_NGINX_HTTP_CLIENT)
+static void ngx_js_fetch_error(ngx_http_client_cb_t *cb, const char *err);
+#else
 static void ngx_js_fetch_error(ngx_js_http_t *http, const char *err);
+#endif
 static void ngx_js_fetch_destructor(ngx_js_event_t *event);
 static njs_int_t ngx_js_fetch_promissified_result(njs_vm_t *vm,
     njs_value_t *result, njs_int_t rc, njs_value_t *retval);
@@ -51,10 +65,17 @@ static njs_int_t ngx_js_request_constructor(njs_vm_t *vm,
     ngx_js_request_t *request, ngx_url_t *u, njs_external_ptr_t external,
     njs_value_t *args, njs_uint_t nargs);
 
+#if (NJS_USE_NGINX_HTTP_CLIENT)
+static ngx_int_t ngx_js_fetch_append_headers(ngx_http_client_cb_t *cb,
+    ngx_http_client_headers_t *headers, u_char *name, size_t len,
+    u_char *value, size_t vlen);
+static void ngx_js_fetch_process_done(ngx_http_client_cb_t *cb);
+#else
 static ngx_int_t ngx_js_fetch_append_headers(ngx_js_http_t *http,
     ngx_js_headers_t *headers, u_char *name, size_t len, u_char *value,
     size_t vlen);
 static void ngx_js_fetch_process_done(ngx_js_http_t *http);
+#endif
 static njs_int_t ngx_js_headers_append(njs_vm_t *vm, ngx_js_headers_t *headers,
     u_char *name, size_t len, u_char *value, size_t vlen);
 
@@ -499,6 +520,248 @@ njs_module_t  ngx_js_fetch_module = {
 };
 
 
+#if (NJS_USE_NGINX_HTTP_CLIENT)
+
+static ngx_int_t
+ngx_js_fetch_convert_headers(ngx_pool_t *pool, ngx_js_request_t *js_req,
+    ngx_http_client_request_t *client_req)
+{
+    ngx_uint_t                  i;
+    ngx_flag_t                  has_user_agent;
+    ngx_list_part_t            *part;
+    ngx_js_tb_elt_t            *h;
+    ngx_http_client_header_t   *ch;
+
+    static const u_char  user_agent[] = "nginx-js";
+
+    if (ngx_list_init(&client_req->headers.header_list, pool, 4,
+                      sizeof(ngx_http_client_header_t))
+        != NGX_OK)
+    {
+        return NGX_ERROR;
+    }
+
+    has_user_agent = 0;
+
+    part = &js_req->headers.header_list.part;
+    h = part->elts;
+
+    for (i = 0; /* void */; i++) {
+
+        if (i >= part->nelts) {
+            if (part->next == NULL) {
+                break;
+            }
+
+            part = part->next;
+            h = part->elts;
+            i = 0;
+        }
+
+        if (h[i].hash == 0) {
+            continue;
+        }
+
+        if (h[i].key.len == sizeof("User-Agent") - 1
+            && ngx_strncasecmp(h[i].key.data, (u_char *) "User-Agent",
+                               sizeof("User-Agent") - 1) == 0)
+        {
+            has_user_agent = 1;
+        }
+
+        ch = ngx_list_push(&client_req->headers.header_list);
+        if (ch == NULL) {
+            return NGX_ERROR;
+        }
+
+        ch->hash = 1;
+        ch->key = h[i].key;
+        ch->value = h[i].value;
+        ch->next = NULL;
+    }
+
+    if (!has_user_agent) {
+        ch = ngx_list_push(&client_req->headers.header_list);
+        if (ch == NULL) {
+            return NGX_ERROR;
+        }
+
+        ch->hash = 1;
+        ch->key.data = (u_char *) "User-Agent";
+        ch->key.len = sizeof("User-Agent") - 1;
+        ch->value.data = (u_char *) user_agent;
+        ch->value.len = sizeof(user_agent) - 1;
+        ch->next = NULL;
+    }
+
+    return NGX_OK;
+}
+
+
+njs_int_t
+ngx_js_ext_fetch(njs_vm_t *vm, njs_value_t *args, njs_uint_t nargs,
+    njs_index_t unused, njs_value_t *retval)
+{
+    ngx_int_t                    rc;
+    njs_int_t                    ret;
+    ngx_url_t                    u;
+    ngx_pool_t                  *pool;
+    njs_value_t                 *init, *value;
+    ngx_js_fetch_t              *fetch;
+    ngx_js_request_t             request;
+    ngx_connection_t            *c;
+    njs_external_ptr_t           external;
+    njs_opaque_value_t           lvalue;
+    ngx_js_loc_conf_t           *conf;
+    ngx_http_client_request_t    client_req;
+
+    static const njs_str_t buffer_size_key = njs_str("buffer_size");
+    static const njs_str_t body_size_key = njs_str("max_response_body_size");
+#if (NGX_SSL)
+    static const njs_str_t verify_key = njs_str("verify");
+#endif
+
+    external = njs_vm_external_ptr(vm);
+    c = ngx_external_connection(vm, external);
+    pool = ngx_external_pool(vm, external);
+    conf = ngx_external_loc_conf(vm, external);
+
+    fetch = ngx_js_fetch_alloc(vm, pool, c->log, conf);
+    if (fetch == NULL) {
+        return NJS_ERROR;
+    }
+
+    ret = ngx_js_request_constructor(vm, &request, &u, external, args, nargs);
+    if (ret != NJS_OK) {
+        goto fail;
+    }
+
+    if (u.host.len >= NGX_JS_HOST_MAX_LEN) {
+        njs_vm_error(vm, "Host name too long");
+        goto fail;
+    }
+
+    fetch->response.url = request.url;
+    fetch->conf.buffer_size = conf->buffer_size;
+    fetch->conf.max_response_body_size = conf->max_response_body_size;
+
+#if (NGX_SSL)
+    if (ngx_js_https(&u)) {
+        fetch->conf.ssl = conf->ssl;
+        fetch->conf.ssl_verify = conf->ssl_verify;
+    }
+#endif
+
+    init = njs_arg(args, nargs, 2);
+
+    if (njs_value_is_object(init)) {
+        value = njs_vm_object_prop(vm, init, &buffer_size_key, &lvalue);
+        if (value != NULL
+            && ngx_js_integer(vm, value, &fetch->conf.buffer_size)
+               != NGX_OK)
+        {
+            goto fail;
+        }
+
+        value = njs_vm_object_prop(vm, init, &body_size_key, &lvalue);
+        if (value != NULL
+            && ngx_js_integer(vm, value, &fetch->conf.max_response_body_size)
+               != NGX_OK)
+        {
+            goto fail;
+        }
+
+#if (NGX_SSL)
+        value = njs_vm_object_prop(vm, init, &verify_key, &lvalue);
+        if (value != NULL) {
+            fetch->conf.ssl_verify = njs_value_bool(value);
+        }
+#endif
+    }
+
+#if (NGX_SSL)
+    if (fetch->conf.ssl != NULL && !fetch->conf.ssl_verify) {
+        fetch->conf.use_keepalive = 0;
+    }
+#endif
+
+    if (request.method.len == 4
+        && ngx_strncasecmp(request.method.data, (u_char *) "HEAD", 4) == 0)
+    {
+        fetch->conf.header_only = 1;
+    }
+
+    NJS_CHB_MP_INIT(&fetch->response.chain, njs_vm_memory_pool(vm));
+
+    if (ngx_js_check_request_line_component(u.uri.data, u.uri.len) != NGX_OK)
+    {
+        njs_vm_error(vm, "invalid url");
+        goto fail;
+    }
+
+    /* configure proxy */
+
+    if (ngx_js_conf_proxy(conf)) {
+        if (ngx_js_conf_dynamic_proxy(conf)) {
+            if (conf->eval_proxy_url(pool, external, conf,
+                                     &fetch->conf.proxy_url,
+                                     &fetch->conf.proxy_auth)
+                != NGX_OK)
+            {
+                njs_vm_error(vm, "failed to evaluate proxy URL");
+                goto fail;
+            }
+
+        } else {
+            fetch->conf.proxy_url = conf->fetch_proxy_url;
+            fetch->conf.proxy_auth = conf->fetch_proxy_auth_header;
+        }
+    }
+
+    /* build client request */
+
+    ngx_memzero(&client_req, sizeof(ngx_http_client_request_t));
+    client_req.method = request.method;
+    client_req.body = request.body;
+
+    if (ngx_js_fetch_convert_headers(pool, &request, &client_req) != NGX_OK) {
+        njs_vm_memory_error(vm);
+        goto fail;
+    }
+
+    /* init and send request */
+
+    fetch->client = ngx_http_client_init(pool, c->log, &fetch->conf);
+    if (fetch->client == NULL) {
+        njs_vm_memory_error(vm);
+        goto fail;
+    }
+
+    rc = ngx_http_client_request(fetch->client, &u, &u.uri, &client_req,
+                                 ngx_external_resolver(vm, external),
+                                 ngx_external_resolver_timeout(vm, external));
+    if (rc == NGX_ERROR) {
+        njs_vm_error(vm, "fetch request failed");
+        goto fail;
+    }
+
+    njs_value_assign(retval, njs_value_arg(&fetch->promise));
+
+    return NJS_OK;
+
+fail:
+
+    ngx_log_debug2(NGX_LOG_DEBUG_EVENT, fetch->log, 0,
+                   "js http done fetch:%p rc:%d", fetch, NJS_ERROR);
+
+    ngx_js_del_event(ngx_external_ctx(vm,  njs_vm_external_ptr(vm)),
+                     fetch->event);
+
+    return ngx_js_fetch_promissified_result(vm, NULL, NJS_ERROR, retval);
+}
+
+#else /* !NJS_USE_NGINX_HTTP_CLIENT */
+
 njs_int_t
 ngx_js_ext_fetch(njs_vm_t *vm, njs_value_t *args, njs_uint_t nargs,
     njs_index_t unused, njs_value_t *retval)
@@ -662,7 +925,8 @@ ngx_js_ext_fetch(njs_vm_t *vm, njs_value_t *args, njs_uint_t nargs,
     http->addrs = &http->addr;
 
     if (ngx_js_http_proxy(http)) {
-        ngx_memcpy(&http->addr, &http->proxy.url->addrs[0], sizeof(ngx_addr_t));
+        ngx_memcpy(&http->addr, &http->proxy.url->addrs[0],
+                   sizeof(ngx_addr_t));
 
     } else {
         ngx_memcpy(&http->addr, &u.addrs[0], sizeof(ngx_addr_t));
@@ -684,6 +948,8 @@ fail:
 
     return ngx_js_fetch_promissified_result(vm, NULL, NJS_ERROR, retval);
 }
+
+#endif /* NJS_USE_NGINX_HTTP_CLIENT */
 
 
 static njs_int_t
@@ -1078,7 +1344,6 @@ ngx_js_fetch_alloc(njs_vm_t *vm, ngx_pool_t *pool, ngx_log_t *log,
 {
     njs_int_t        ret;
     ngx_js_ctx_t    *ctx;
-    ngx_js_http_t   *http;
     ngx_js_fetch_t  *fetch;
     ngx_js_event_t  *event;
     njs_function_t  *callback;
@@ -1088,25 +1353,60 @@ ngx_js_fetch_alloc(njs_vm_t *vm, ngx_pool_t *pool, ngx_log_t *log,
         goto failed;
     }
 
+#if (NJS_USE_NGINX_HTTP_CLIENT)
+
+    fetch->pool = pool;
+    fetch->log = log;
+
+    /* initialize response header list */
+
+    if (ngx_list_init(&fetch->response.headers.header_list, pool, 4,
+                      sizeof(ngx_js_tb_elt_t))
+        != NGX_OK)
+    {
+        goto failed;
+    }
+
+    /*
+     * Copy the shared conf as a base, then set per-request callbacks.
+     * The keepalive queues are pointers shared across all requests
+     * from the same location conf.
+     */
+
+    fetch->conf = conf->fetch_client_conf;
+    fetch->conf.timeout = conf->timeout;
+    fetch->conf.buffer_size = conf->buffer_size;
+    fetch->conf.max_response_body_size = conf->max_response_body_size;
+
+    fetch->conf.use_keepalive = (conf->fetch_client_conf.keepalive > 0
+                                 && !ngx_js_conf_dynamic_proxy(conf));
+
+    fetch->conf.append_headers = ngx_js_fetch_append_headers;
+    fetch->conf.ready_handler = ngx_js_fetch_process_done;
+    fetch->conf.error_handler = ngx_js_fetch_error;
+    fetch->conf.cb_data = fetch;
+
+#else /* !NJS_USE_NGINX_HTTP_CLIENT */
+
     /*
      * set by ngx_pcalloc():
      *
      * fetch->http.proxy.state = HTTP_STATE_DIRECT;
      */
 
-    http = &fetch->http;
+    fetch->http.pool = pool;
+    fetch->http.log = log;
+    fetch->http.conf = conf;
 
-    http->pool = pool;
-    http->log = log;
-    http->conf = conf;
+    fetch->http.content_length_n = -1;
+    fetch->http.keepalive = (conf->fetch_keepalive > 0
+                             && !ngx_js_conf_dynamic_proxy(conf));
 
-    http->content_length_n = -1;
-    http->keepalive = (conf->fetch_keepalive > 0
-                       && !ngx_js_conf_dynamic_proxy(conf));
+    fetch->http.append_headers = ngx_js_fetch_append_headers;
+    fetch->http.ready_handler = ngx_js_fetch_process_done;
+    fetch->http.error_handler = ngx_js_fetch_error;
 
-    http->append_headers = ngx_js_fetch_append_headers;
-    http->ready_handler = ngx_js_fetch_process_done;
-    http->error_handler = ngx_js_fetch_error;
+#endif /* NJS_USE_NGINX_HTTP_CLIENT */
 
     ret = njs_vm_promise_create(vm, njs_value_arg(&fetch->promise),
                                 njs_value_arg(&fetch->promise_callbacks));
@@ -1149,6 +1449,41 @@ failed:
 }
 
 
+#if (NJS_USE_NGINX_HTTP_CLIENT)
+
+static void
+ngx_js_fetch_error(ngx_http_client_cb_t *cb, const char *err)
+{
+    ngx_js_fetch_t  *fetch;
+
+    fetch = cb->data;
+
+    njs_vm_error(fetch->vm, err);
+
+    njs_vm_exception_get(fetch->vm, njs_value_arg(&fetch->response_value));
+
+    ngx_js_fetch_done(fetch, &fetch->response_value, NJS_ERROR);
+}
+
+
+static void
+ngx_js_fetch_destructor(ngx_js_event_t *event)
+{
+    ngx_js_fetch_t  *fetch;
+
+    fetch = event->data;
+
+    ngx_log_debug1(NGX_LOG_DEBUG_EVENT, fetch->log, 0, "js http destructor:%p",
+                   fetch);
+
+    if (fetch->client != NULL) {
+        ngx_http_client_resolve_done(fetch->client);
+        ngx_http_client_close_peer(fetch->client);
+    }
+}
+
+#else /* !NJS_USE_NGINX_HTTP_CLIENT */
+
 static void
 ngx_js_fetch_error(ngx_js_http_t *http, const char *err)
 {
@@ -1167,18 +1502,18 @@ ngx_js_fetch_error(ngx_js_http_t *http, const char *err)
 static void
 ngx_js_fetch_destructor(ngx_js_event_t *event)
 {
-    ngx_js_http_t   *http;
     ngx_js_fetch_t  *fetch;
 
     fetch = event->data;
-    http = &fetch->http;
 
-    ngx_log_debug1(NGX_LOG_DEBUG_EVENT, http->log, 0, "js http destructor:%p",
-                   fetch);
+    ngx_log_debug1(NGX_LOG_DEBUG_EVENT, (&fetch->http)->log, 0,
+                   "js http destructor:%p", fetch);
 
-    ngx_js_http_resolve_done(http);
-    ngx_js_http_close_peer(http);
+    ngx_js_http_resolve_done(&fetch->http);
+    ngx_js_http_close_peer(&fetch->http);
 }
+
+#endif /* NJS_USE_NGINX_HTTP_CLIENT */
 
 
 static njs_int_t
@@ -1232,16 +1567,27 @@ ngx_js_fetch_done(ngx_js_fetch_t *fetch, njs_opaque_value_t *retval,
 {
     njs_vm_t            *vm;
     ngx_js_ctx_t        *ctx;
+#if !(NJS_USE_NGINX_HTTP_CLIENT)
     ngx_js_http_t       *http;
+#endif
     ngx_js_event_t      *event;
     njs_opaque_value_t   arguments[2], *action;
 
+#if (NJS_USE_NGINX_HTTP_CLIENT)
+    ngx_log_debug2(NGX_LOG_DEBUG_EVENT, fetch->log, 0,
+                   "js http done fetch:%p rc:%i", fetch, (ngx_int_t) rc);
+
+    if (fetch->client != NULL) {
+        ngx_http_client_close_peer(fetch->client);
+    }
+#else
     http = &fetch->http;
 
     ngx_log_debug2(NGX_LOG_DEBUG_EVENT, http->log, 0,
                    "js http done fetch:%p rc:%i", fetch, (ngx_int_t) rc);
 
     ngx_js_http_close_peer(http);
+#endif
 
     if (fetch->event != NULL) {
         action = &fetch->promise_callbacks[(rc != NJS_OK)];
@@ -1497,6 +1843,63 @@ ngx_js_request_constructor(njs_vm_t *vm, ngx_js_request_t *request,
 }
 
 
+#if (NJS_USE_NGINX_HTTP_CLIENT)
+
+static ngx_int_t
+ngx_js_fetch_append_headers(ngx_http_client_cb_t *cb,
+    ngx_http_client_headers_t *headers, u_char *name, size_t len,
+    u_char *value, size_t vlen)
+{
+    ngx_js_fetch_t  *fetch;
+
+    fetch = cb->data;
+
+    return ngx_js_headers_append(fetch->vm, &fetch->response.headers,
+                                 name, len, value, vlen);
+}
+
+
+static void
+ngx_js_fetch_process_done(ngx_http_client_cb_t *cb)
+{
+    njs_int_t                      ret;
+    ngx_chain_t                   *cl;
+    ngx_js_fetch_t                *fetch;
+    ngx_http_client_response_t    *resp;
+
+    fetch = cb->data;
+    resp = &cb->response;
+
+    /* copy status code and status text */
+
+    fetch->response.code = resp->code;
+    fetch->response.status_text = resp->status_text;
+
+    /* convert body from ngx_chain_t to njs_chb_t */
+
+    for (cl = resp->body; cl; cl = cl->next) {
+        njs_chb_append(&fetch->response.chain,
+                       cl->buf->pos, cl->buf->last - cl->buf->pos);
+    }
+
+    /* mark response headers as immutable */
+
+    fetch->response.headers.guard = GUARD_IMMUTABLE;
+
+    ret = njs_vm_external_create(fetch->vm,
+                                 njs_value_arg(&fetch->response_value),
+                                 ngx_http_js_fetch_response_proto_id,
+                                 &fetch->response, 0);
+    if (ret != NJS_OK) {
+        ngx_js_fetch_error(cb, "fetch response creation failed");
+        return;
+    }
+
+    ngx_js_fetch_done(fetch, &fetch->response_value, NJS_OK);
+}
+
+#else /* !NJS_USE_NGINX_HTTP_CLIENT */
+
 static ngx_int_t
 ngx_js_fetch_append_headers(ngx_js_http_t *http, ngx_js_headers_t *headers,
     u_char *name, size_t len, u_char *value, size_t vlen)
@@ -1512,7 +1915,7 @@ ngx_js_fetch_append_headers(ngx_js_http_t *http, ngx_js_headers_t *headers,
 static void
 ngx_js_fetch_process_done(ngx_js_http_t *http)
 {
-    njs_int_t       ret;
+    njs_int_t        ret;
     ngx_js_fetch_t  *fetch;
 
     fetch = (ngx_js_fetch_t *) http;
@@ -1528,6 +1931,8 @@ ngx_js_fetch_process_done(ngx_js_http_t *http)
 
     ngx_js_fetch_done(fetch, &fetch->response_value, NJS_OK);
 }
+
+#endif /* NJS_USE_NGINX_HTTP_CLIENT */
 
 
 static njs_int_t

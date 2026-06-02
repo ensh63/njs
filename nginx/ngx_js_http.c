@@ -11,6 +11,8 @@
 #include "ngx_js_http.h"
 
 
+#if !(NJS_USE_NGINX_HTTP_CLIENT)
+
 typedef struct {
     ngx_js_loc_conf_t     *conf;
     ngx_queue_t            queue;
@@ -2075,6 +2077,8 @@ ngx_js_http_keepalive_close_handler(ngx_event_t *ev)
     ngx_queue_insert_head(&conf->fetch_keepalive_free, &cache->queue);
 }
 
+#endif /* !(NJS_USE_NGINX_HTTP_CLIENT) */
+
 
 ngx_buf_t *
 ngx_js_chain_to_buf(ngx_pool_t *pool, njs_chb_t *chain)
@@ -2098,6 +2102,8 @@ ngx_js_chain_to_buf(ngx_pool_t *pool, njs_chb_t *chain)
     return buf;
 }
 
+
+#if !(NJS_USE_NGINX_HTTP_CLIENT)
 
 static void
 ngx_js_fetch_append_request_headers(njs_chb_t *chain,
@@ -2281,3 +2287,5 @@ ngx_js_fetch_build_request(ngx_js_http_t *http, ngx_js_request_t *request,
         }
     }
 }
+
+#endif /* !(NJS_USE_NGINX_HTTP_CLIENT) */

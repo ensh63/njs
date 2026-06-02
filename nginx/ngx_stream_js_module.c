@@ -365,28 +365,44 @@ static ngx_command_t  ngx_stream_js_commands[] = {
       NGX_STREAM_MAIN_CONF|NGX_STREAM_SRV_CONF|NGX_CONF_TAKE1,
       ngx_conf_set_num_slot,
       NGX_STREAM_SRV_CONF_OFFSET,
+#if (NJS_USE_NGINX_HTTP_CLIENT)
+      offsetof(ngx_stream_js_srv_conf_t, fetch_client_conf.keepalive),
+#else
       offsetof(ngx_stream_js_srv_conf_t, fetch_keepalive),
+#endif
       NULL },
 
     { ngx_string("js_fetch_keepalive_requests"),
       NGX_STREAM_MAIN_CONF|NGX_STREAM_SRV_CONF|NGX_CONF_TAKE1,
       ngx_conf_set_num_slot,
       NGX_STREAM_SRV_CONF_OFFSET,
+#if (NJS_USE_NGINX_HTTP_CLIENT)
+      offsetof(ngx_stream_js_srv_conf_t, fetch_client_conf.keepalive_requests),
+#else
       offsetof(ngx_stream_js_srv_conf_t, fetch_keepalive_requests),
+#endif
       NULL },
 
     { ngx_string("js_fetch_keepalive_time"),
       NGX_STREAM_MAIN_CONF|NGX_STREAM_SRV_CONF|NGX_CONF_TAKE1,
       ngx_conf_set_msec_slot,
       NGX_STREAM_SRV_CONF_OFFSET,
+#if (NJS_USE_NGINX_HTTP_CLIENT)
+      offsetof(ngx_stream_js_srv_conf_t, fetch_client_conf.keepalive_time),
+#else
       offsetof(ngx_stream_js_srv_conf_t, fetch_keepalive_time),
+#endif
       NULL },
 
     { ngx_string("js_fetch_keepalive_timeout"),
       NGX_STREAM_MAIN_CONF|NGX_STREAM_SRV_CONF|NGX_CONF_TAKE1,
       ngx_conf_set_msec_slot,
       NGX_STREAM_SRV_CONF_OFFSET,
+#if (NJS_USE_NGINX_HTTP_CLIENT)
+      offsetof(ngx_stream_js_srv_conf_t, fetch_client_conf.keepalive_timeout),
+#else
       offsetof(ngx_stream_js_srv_conf_t, fetch_keepalive_timeout),
+#endif
       NULL },
 
 #if (NGX_SSL)

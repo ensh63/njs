@@ -722,28 +722,44 @@ static ngx_command_t  ngx_http_js_commands[] = {
       NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_TAKE1,
       ngx_conf_set_num_slot,
       NGX_HTTP_LOC_CONF_OFFSET,
+#if (NJS_USE_NGINX_HTTP_CLIENT)
+      offsetof(ngx_http_js_loc_conf_t, fetch_client_conf.keepalive),
+#else
       offsetof(ngx_http_js_loc_conf_t, fetch_keepalive),
+#endif
       NULL },
 
     { ngx_string("js_fetch_keepalive_requests"),
       NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_TAKE1,
       ngx_conf_set_num_slot,
       NGX_HTTP_LOC_CONF_OFFSET,
+#if (NJS_USE_NGINX_HTTP_CLIENT)
+      offsetof(ngx_http_js_loc_conf_t, fetch_client_conf.keepalive_requests),
+#else
       offsetof(ngx_http_js_loc_conf_t, fetch_keepalive_requests),
+#endif
       NULL },
 
     { ngx_string("js_fetch_keepalive_time"),
       NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_TAKE1,
       ngx_conf_set_msec_slot,
       NGX_HTTP_LOC_CONF_OFFSET,
+#if (NJS_USE_NGINX_HTTP_CLIENT)
+      offsetof(ngx_http_js_loc_conf_t, fetch_client_conf.keepalive_time),
+#else
       offsetof(ngx_http_js_loc_conf_t, fetch_keepalive_time),
+#endif
       NULL },
 
     { ngx_string("js_fetch_keepalive_timeout"),
       NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_TAKE1,
       ngx_conf_set_msec_slot,
       NGX_HTTP_LOC_CONF_OFFSET,
+#if (NJS_USE_NGINX_HTTP_CLIENT)
+      offsetof(ngx_http_js_loc_conf_t, fetch_client_conf.keepalive_timeout),
+#else
       offsetof(ngx_http_js_loc_conf_t, fetch_keepalive_timeout),
+#endif
       NULL },
 
     { ngx_string("js_fetch_proxy"),

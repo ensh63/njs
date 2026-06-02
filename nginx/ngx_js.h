@@ -14,6 +14,9 @@
 #include <ngx_core.h>
 #include <ngx_event.h>
 #include <ngx_event_connect.h>
+#if (NJS_USE_NGINX_HTTP_CLIENT)
+#include <ngx_http_client.h>
+#endif
 #include <njs.h>
 #include <njs_rbtree.h>
 #include <njs_arr.h>
@@ -130,6 +133,20 @@ typedef struct {
     ngx_array_t           *periodics                                          \
 
 
+#if (NJS_USE_NGINX_HTTP_CLIENT)
+#define NJS_FETCH_KEEPALIVE_FIELDS                                            \
+    ngx_http_client_conf_t  fetch_client_conf;
+#else
+#define NJS_FETCH_KEEPALIVE_FIELDS                                            \
+    ngx_uint_t             fetch_keepalive;                                   \
+    ngx_uint_t             fetch_keepalive_requests;                          \
+    ngx_msec_t             fetch_keepalive_time;                              \
+    ngx_msec_t             fetch_keepalive_timeout;                           \
+    ngx_queue_t            fetch_keepalive_cache;                             \
+    ngx_queue_t            fetch_keepalive_free;
+#endif
+
+
 #define _NGX_JS_COMMON_LOC_CONF                                               \
     ngx_uint_t             type;                                              \
     ngx_engine_t          *engine;                                            \
@@ -146,12 +163,7 @@ typedef struct {
     size_t                 max_response_body_size;                            \
     ngx_msec_t             timeout;                                           \
                                                                               \
-    ngx_uint_t             fetch_keepalive;                                   \
-    ngx_uint_t             fetch_keepalive_requests;                          \
-    ngx_msec_t             fetch_keepalive_time;                              \
-    ngx_msec_t             fetch_keepalive_timeout;                           \
-    ngx_queue_t            fetch_keepalive_cache;                             \
-    ngx_queue_t            fetch_keepalive_free;                              \
+    NJS_FETCH_KEEPALIVE_FIELDS                                                \
                                                                               \
     ngx_url_t              *fetch_proxy_url;                                  \
     ngx_str_t               fetch_proxy_auth_header;                          \

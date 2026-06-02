@@ -16,15 +16,25 @@ typedef struct {
 
 
 typedef struct {
-    ngx_js_http_t    http;
+#if (NJS_USE_NGINX_HTTP_CLIENT)
+    ngx_http_client_t         *client;
+    ngx_http_client_conf_t     conf;
 
-    JSContext        *cx;
-    ngx_qjs_event_t  *event;
+    ngx_pool_t                *pool;
+    ngx_log_t                 *log;
 
-    JSValue           response_value;
+    ngx_js_response_t          response;
+#else
+    ngx_js_http_t              http;
+#endif
 
-    JSValue           promise;
-    JSValue           promise_callbacks[2];
+    JSContext                  *cx;
+    ngx_qjs_event_t           *event;
+
+    JSValue                    response_value;
+
+    JSValue                    promise;
+    JSValue                    promise_callbacks[2];
 } ngx_qjs_fetch_t;
 
 
@@ -36,7 +46,11 @@ static ngx_int_t ngx_qjs_headers_fill(JSContext *cx, ngx_js_headers_t *headers,
     JSValue init);
 static ngx_qjs_fetch_t *ngx_qjs_fetch_alloc(JSContext *cx, ngx_pool_t *pool,
     ngx_log_t *log, ngx_js_loc_conf_t *conf);
+#if (NJS_USE_NGINX_HTTP_CLIENT)
+static void ngx_qjs_fetch_error(ngx_http_client_cb_t *cb, const char *err);
+#else
 static void ngx_qjs_fetch_error(ngx_js_http_t *http, const char *err);
+#endif
 static void ngx_qjs_fetch_destructor(ngx_qjs_event_t *event);
 static void ngx_qjs_fetch_done(ngx_qjs_fetch_t *fetch, JSValue retval,
     ngx_int_t rc);
@@ -44,10 +58,17 @@ static void ngx_qjs_fetch_done(ngx_qjs_fetch_t *fetch, JSValue retval,
 static ngx_int_t ngx_qjs_request_ctor(JSContext *cx, ngx_js_request_t *request,
     ngx_url_t *u, int argc, JSValueConst *argv);
 
+#if (NJS_USE_NGINX_HTTP_CLIENT)
+static ngx_int_t ngx_qjs_fetch_append_headers(ngx_http_client_cb_t *cb,
+    ngx_http_client_headers_t *headers, u_char *name, size_t len, u_char *value,
+    size_t vlen);
+static void ngx_qjs_fetch_process_done(ngx_http_client_cb_t *cb);
+#else
 static ngx_int_t ngx_qjs_fetch_append_headers(ngx_js_http_t *http,
     ngx_js_headers_t *headers, u_char *name, size_t len, u_char *value,
     size_t vlen);
 static void ngx_qjs_fetch_process_done(ngx_js_http_t *http);
+#endif
 static ngx_int_t ngx_qjs_headers_append(JSContext *cx,
     ngx_js_headers_t *headers, u_char *name, size_t len, u_char *value,
     size_t vlen);
@@ -224,6 +245,254 @@ qjs_module_t  ngx_qjs_ngx_fetch_module = {
     .init = ngx_qjs_fetch_init,
 };
 
+
+#if (NJS_USE_NGINX_HTTP_CLIENT)
+
+static ngx_int_t
+ngx_qjs_fetch_convert_headers(ngx_pool_t *pool, ngx_js_request_t *js_req,
+    ngx_http_client_request_t *client_req)
+{
+    ngx_uint_t                  i;
+    ngx_flag_t                  has_user_agent;
+    ngx_list_part_t            *part;
+    ngx_js_tb_elt_t            *h;
+    ngx_http_client_header_t   *ch;
+
+    static const u_char  user_agent[] = "nginx-js";
+
+    if (ngx_list_init(&client_req->headers.header_list, pool, 4,
+                      sizeof(ngx_http_client_header_t))
+        != NGX_OK)
+    {
+        return NGX_ERROR;
+    }
+
+    has_user_agent = 0;
+
+    part = &js_req->headers.header_list.part;
+    h = part->elts;
+
+    for (i = 0; /* void */; i++) {
+
+        if (i >= part->nelts) {
+            if (part->next == NULL) {
+                break;
+            }
+
+            part = part->next;
+            h = part->elts;
+            i = 0;
+        }
+
+        if (h[i].hash == 0) {
+            continue;
+        }
+
+        if (h[i].key.len == sizeof("User-Agent") - 1
+            && ngx_strncasecmp(h[i].key.data, (u_char *) "User-Agent",
+                               sizeof("User-Agent") - 1) == 0)
+        {
+            has_user_agent = 1;
+        }
+
+        ch = ngx_list_push(&client_req->headers.header_list);
+        if (ch == NULL) {
+            return NGX_ERROR;
+        }
+
+        ch->hash = 1;
+        ch->key = h[i].key;
+        ch->value = h[i].value;
+        ch->next = NULL;
+    }
+
+    if (!has_user_agent) {
+        ch = ngx_list_push(&client_req->headers.header_list);
+        if (ch == NULL) {
+            return NGX_ERROR;
+        }
+
+        ch->hash = 1;
+        ch->key.data = (u_char *) "User-Agent";
+        ch->key.len = sizeof("User-Agent") - 1;
+        ch->value.data = (u_char *) user_agent;
+        ch->value.len = sizeof(user_agent) - 1;
+        ch->next = NULL;
+    }
+
+    return NGX_OK;
+}
+
+
+JSValue
+ngx_qjs_ext_fetch(JSContext *cx, JSValueConst this_val, int argc,
+    JSValueConst *argv)
+{
+    void                       *external;
+    JSValue                     init, value, promise;
+    ngx_int_t                   rc;
+    ngx_url_t                   u;
+    ngx_pool_t                 *pool;
+    ngx_js_ctx_t               *ctx;
+    ngx_js_loc_conf_t          *conf;
+    ngx_qjs_fetch_t            *fetch;
+    ngx_connection_t           *c;
+    ngx_js_request_t            request;
+    ngx_http_client_request_t   client_req;
+
+    external = JS_GetContextOpaque(cx);
+    c = ngx_qjs_external_connection(cx, external);
+    pool = ngx_qjs_external_pool(cx, external);
+
+    conf = ngx_qjs_external_loc_conf(cx, external);
+
+    fetch = ngx_qjs_fetch_alloc(cx, pool, c->log, conf);
+    if (fetch == NULL) {
+        return JS_ThrowOutOfMemory(cx);
+    }
+
+    promise = JS_DupValue(cx, fetch->promise);
+
+    rc = ngx_qjs_request_ctor(cx, &request, &u, argc, argv);
+    if (rc != NGX_OK) {
+        goto fail;
+    }
+
+    if (u.host.len >= NGX_JS_HOST_MAX_LEN) {
+        JS_ThrowInternalError(cx, "Host name too long");
+        goto fail;
+    }
+
+    fetch->response.url = request.url;
+    fetch->conf.buffer_size = conf->buffer_size;
+    fetch->conf.max_response_body_size = conf->max_response_body_size;
+
+#if (NGX_SSL)
+    if (ngx_js_https(&u)) {
+        fetch->conf.ssl = ngx_qjs_external_ssl(cx, external);
+        fetch->conf.ssl_verify = ngx_qjs_external_ssl_verify(cx, external);
+    }
+#endif
+
+    if (JS_IsObject(argv[1])) {
+        init = argv[1];
+        value = JS_GetPropertyStr(cx, init, "buffer_size");
+        if (JS_IsException(value)) {
+            goto fail;
+        }
+
+        if (!JS_IsUndefined(value)) {
+            if (JS_ToInt64(cx, (int64_t *) &fetch->conf.buffer_size,
+                           value) < 0)
+            {
+                JS_FreeValue(cx, value);
+                goto fail;
+            }
+        }
+
+        value = JS_GetPropertyStr(cx, init, "max_response_body_size");
+        if (JS_IsException(value)) {
+            goto fail;
+        }
+
+        if (!JS_IsUndefined(value)) {
+            if (JS_ToInt64(cx, (int64_t *) &fetch->conf.max_response_body_size,
+                           value) < 0)
+            {
+                JS_FreeValue(cx, value);
+                goto fail;
+            }
+        }
+
+#if (NGX_SSL)
+        value = JS_GetPropertyStr(cx, init, "verify");
+        if (JS_IsException(value)) {
+            goto fail;
+        }
+
+        if (!JS_IsUndefined(value)) {
+            fetch->conf.ssl_verify = JS_ToBool(cx, value);
+        }
+#endif
+    }
+
+#if (NGX_SSL)
+    if (fetch->conf.ssl != NULL && !fetch->conf.ssl_verify) {
+        fetch->conf.use_keepalive = 0;
+    }
+#endif
+
+    if (request.method.len == 4
+        && ngx_strncasecmp(request.method.data, (u_char *) "HEAD", 4) == 0)
+    {
+        fetch->conf.header_only = 1;
+    }
+
+    ctx = ngx_qjs_external_ctx(cx, JS_GetContextOpaque(cx));
+
+    NJS_CHB_MP_INIT(&fetch->response.chain, ctx->engine->pool);
+
+    if (ngx_js_conf_proxy(conf)) {
+        if (ngx_js_conf_dynamic_proxy(conf)) {
+            if (conf->eval_proxy_url(fetch->pool, external, conf,
+                                     &fetch->conf.proxy_url,
+                                     &fetch->conf.proxy_auth)
+                != NGX_OK)
+            {
+                JS_ThrowInternalError(cx, "failed to evaluate proxy URL");
+                return JS_EXCEPTION;
+            }
+
+        } else {
+            fetch->conf.proxy_url = conf->fetch_proxy_url;
+            fetch->conf.proxy_auth = conf->fetch_proxy_auth_header;
+        }
+    }
+
+    if (ngx_js_check_request_line_component(u.uri.data, u.uri.len) != NGX_OK) {
+        JS_ThrowInternalError(cx, "invalid url");
+        goto fail;
+    }
+
+    ngx_memzero(&client_req, sizeof(ngx_http_client_request_t));
+    client_req.method = request.method;
+    client_req.body = request.body;
+
+    if (ngx_qjs_fetch_convert_headers(pool, &request, &client_req) != NGX_OK) {
+        JS_ThrowOutOfMemory(cx);
+        goto fail;
+    }
+
+    fetch->client = ngx_http_client_init(fetch->pool, fetch->log,
+                                         &fetch->conf);
+    if (fetch->client == NULL) {
+        JS_ThrowOutOfMemory(cx);
+        goto fail;
+    }
+
+    rc = ngx_http_client_request(fetch->client, &u, &u.uri, &client_req,
+                               ngx_qjs_external_resolver(cx, external),
+                               ngx_qjs_external_resolver_timeout(cx, external));
+    if (rc == NGX_ERROR) {
+        JS_ThrowInternalError(cx, "failed to send request");
+        goto fail;
+    }
+
+    return promise;
+
+fail:
+
+    ngx_log_debug2(NGX_LOG_DEBUG_EVENT, fetch->log, 0,
+                   "js http done fetch:%p rc:%d", fetch, NGX_ERROR);
+
+    ngx_js_del_event(ngx_qjs_external_ctx(cx, external), fetch->event);
+
+    JS_FreeValue(cx, promise);
+
+    return qjs_promise_result(cx, JS_EXCEPTION);
+}
+
+#else /* !NJS_USE_NGINX_HTTP_CLIENT */
 
 JSValue
 ngx_qjs_ext_fetch(JSContext *cx, JSValueConst this_val, int argc,
@@ -418,6 +687,8 @@ fail:
 
     return qjs_promise_result(cx, JS_EXCEPTION);
 }
+
+#endif /* NJS_USE_NGINX_HTTP_CLIENT */
 
 
 static JSValue
@@ -1140,7 +1411,6 @@ ngx_qjs_fetch_alloc(JSContext *cx, ngx_pool_t *pool, ngx_log_t *log,
     ngx_js_loc_conf_t *conf)
 {
     ngx_js_ctx_t     *ctx;
-    ngx_js_http_t    *http;
     ngx_qjs_fetch_t  *fetch;
     ngx_qjs_event_t  *event;
 
@@ -1149,28 +1419,58 @@ ngx_qjs_fetch_alloc(JSContext *cx, ngx_pool_t *pool, ngx_log_t *log,
         return NULL;
     }
 
+#if (NJS_USE_NGINX_HTTP_CLIENT)
+
+    fetch->pool = pool;
+    fetch->log = log;
+
+    /* initialize response header list */
+
+    if (ngx_list_init(&fetch->response.headers.header_list, pool, 4,
+                      sizeof(ngx_js_tb_elt_t))
+        != NGX_OK)
+    {
+        return NULL;
+    }
+
+    fetch->conf = conf->fetch_client_conf;
+    fetch->conf.append_headers = ngx_qjs_fetch_append_headers;
+    fetch->conf.ready_handler = ngx_qjs_fetch_process_done;
+    fetch->conf.error_handler = ngx_qjs_fetch_error;
+    fetch->conf.cb_data = fetch;
+
+    fetch->conf.use_keepalive = (conf->fetch_client_conf.keepalive > 0
+                                 && !ngx_js_conf_dynamic_proxy(conf));
+    fetch->conf.timeout = conf->timeout;
+    fetch->conf.buffer_size = conf->buffer_size;
+    fetch->conf.max_response_body_size = conf->max_response_body_size;
+
+    ngx_qjs_arg(fetch->response.header_value) = JS_UNDEFINED;
+
+#else /* !NJS_USE_NGINX_HTTP_CLIENT */
+
     /*
      * set by ngx_pcalloc():
      *
      * fetch->http.proxy.state = HTTP_STATE_DIRECT;
      */
 
-    http = &fetch->http;
+    fetch->http.pool = pool;
+    fetch->http.log = log;
 
-    http->pool = pool;
-    http->log = log;
+    fetch->http.conf = conf;
 
-    http->conf = conf;
+    fetch->http.content_length_n = -1;
+    fetch->http.keepalive = (conf->fetch_keepalive > 0
+                             && !ngx_js_conf_dynamic_proxy(conf));
 
-    http->content_length_n = -1;
-    http->keepalive = (conf->fetch_keepalive > 0
-                       && !ngx_js_conf_dynamic_proxy(conf));
+    ngx_qjs_arg(fetch->http.response.header_value) = JS_UNDEFINED;
 
-    ngx_qjs_arg(http->response.header_value) = JS_UNDEFINED;
+    fetch->http.append_headers = ngx_qjs_fetch_append_headers;
+    fetch->http.ready_handler = ngx_qjs_fetch_process_done;
+    fetch->http.error_handler = ngx_qjs_fetch_error;
 
-    http->append_headers = ngx_qjs_fetch_append_headers;
-    http->ready_handler = ngx_qjs_fetch_process_done;
-    http->error_handler = ngx_qjs_fetch_error;
+#endif /* NJS_USE_NGINX_HTTP_CLIENT */
 
     fetch->promise = JS_NewPromiseCapability(cx, fetch->promise_callbacks);
     if (JS_IsException(fetch->promise)) {
@@ -1210,6 +1510,41 @@ fail:
 }
 
 
+#if (NJS_USE_NGINX_HTTP_CLIENT)
+
+static void
+ngx_qjs_fetch_error(ngx_http_client_cb_t *cb, const char *err)
+{
+    JSValue           reason;
+    ngx_qjs_fetch_t  *fetch;
+
+    fetch = cb->data;
+
+    fetch->response_value = qjs_new_error(fetch->cx);
+    if (JS_IsException(fetch->response_value)) {
+        fetch->response_value = JS_UNDEFINED;
+        goto done;
+    }
+
+    reason = JS_NewString(fetch->cx, err);
+    if (JS_IsException(reason)) {
+        goto done;
+    }
+
+    if (JS_SetPropertyStr(fetch->cx, fetch->response_value, "message",
+                          reason) < 0)
+    {
+        JS_FreeValue(fetch->cx, reason);
+        goto done;
+    }
+
+done:
+
+    ngx_qjs_fetch_done(fetch, fetch->response_value, NGX_ERROR);
+}
+
+#else /* !NJS_USE_NGINX_HTTP_CLIENT */
+
 static void
 ngx_qjs_fetch_error(ngx_js_http_t *http, const char *err)
 {
@@ -1241,16 +1576,30 @@ done:
     ngx_qjs_fetch_done(fetch, fetch->response_value, NGX_ERROR);
 }
 
+#endif /* NJS_USE_NGINX_HTTP_CLIENT */
+
 
 static void
 ngx_qjs_fetch_destructor(ngx_qjs_event_t *event)
 {
-    JSContext        *cx;
+    JSContext         *cx;
+#if !(NJS_USE_NGINX_HTTP_CLIENT)
     ngx_js_http_t    *http;
+#endif
     ngx_qjs_fetch_t  *fetch;
 
     cx = event->ctx;
     fetch = event->data;
+
+#if (NJS_USE_NGINX_HTTP_CLIENT)
+    ngx_log_debug1(NGX_LOG_DEBUG_EVENT, fetch->log, 0, "js http destructor:%p",
+                   fetch);
+
+    if (fetch->client != NULL) {
+        ngx_http_client_resolve_done(fetch->client);
+        ngx_http_client_close_peer(fetch->client);
+    }
+#else
     http = &fetch->http;
 
     ngx_log_debug1(NGX_LOG_DEBUG_EVENT, http->log, 0, "js http destructor:%p",
@@ -1258,6 +1607,7 @@ ngx_qjs_fetch_destructor(ngx_qjs_event_t *event)
 
     ngx_js_http_resolve_done(http);
     ngx_js_http_close_peer(http);
+#endif
 
     JS_FreeValue(cx, fetch->promise_callbacks[0]);
     JS_FreeValue(cx, fetch->promise_callbacks[1]);
@@ -1273,15 +1623,26 @@ ngx_qjs_fetch_done(ngx_qjs_fetch_t *fetch, JSValue retval, ngx_int_t rc)
     JSValue           action;
     JSContext        *cx;
     ngx_js_ctx_t     *ctx;
+#if !(NJS_USE_NGINX_HTTP_CLIENT)
     ngx_js_http_t    *http;
+#endif
     ngx_qjs_event_t  *event;
 
+#if (NJS_USE_NGINX_HTTP_CLIENT)
+    ngx_log_debug2(NGX_LOG_DEBUG_EVENT, fetch->log, 0,
+                   "js http done fetch:%p rc:%i", fetch, rc);
+
+    if (fetch->client) {
+        ngx_http_client_close_peer(fetch->client);
+    }
+#else
     http = &fetch->http;
 
     ngx_log_debug2(NGX_LOG_DEBUG_EVENT, http->log, 0,
                    "js http done fetch:%p rc:%i", fetch, rc);
 
     ngx_js_http_close_peer(http);
+#endif
 
     if (fetch->event != NULL) {
         action = fetch->promise_callbacks[(rc != NGX_OK)];
@@ -1300,6 +1661,23 @@ ngx_qjs_fetch_done(ngx_qjs_fetch_t *fetch, JSValue retval, ngx_int_t rc)
 }
 
 
+#if (NJS_USE_NGINX_HTTP_CLIENT)
+
+static ngx_int_t
+ngx_qjs_fetch_append_headers(ngx_http_client_cb_t *cb,
+    ngx_http_client_headers_t *headers, u_char *name, size_t len, u_char *value,
+    size_t vlen)
+{
+    ngx_qjs_fetch_t  *fetch;
+
+    fetch = cb->data;
+
+    return ngx_qjs_headers_append(fetch->cx, &fetch->response.headers,
+                                  name, len, value, vlen);
+}
+
+#else /* !NJS_USE_NGINX_HTTP_CLIENT */
+
 static ngx_int_t
 ngx_qjs_fetch_append_headers(ngx_js_http_t *http, ngx_js_headers_t *headers,
     u_char *name, size_t len, u_char *value, size_t vlen)
@@ -1312,6 +1690,43 @@ ngx_qjs_fetch_append_headers(ngx_js_http_t *http, ngx_js_headers_t *headers,
                                   name, len, value, vlen);
 }
 
+#endif /* NJS_USE_NGINX_HTTP_CLIENT */
+
+
+#if (NJS_USE_NGINX_HTTP_CLIENT)
+
+static void
+ngx_qjs_fetch_process_done(ngx_http_client_cb_t *cb)
+{
+    ngx_buf_t         *b;
+    ngx_chain_t       *cl;
+    ngx_qjs_fetch_t   *fetch;
+
+    fetch = cb->data;
+
+    fetch->response.code = cb->response.code;
+    fetch->response.status_text = cb->response.status_text;
+
+    for (cl = cb->response.body; cl != NULL; cl = cl->next) {
+        b = cl->buf;
+        njs_chb_append(&fetch->response.chain, b->pos, b->last - b->pos);
+    }
+
+    fetch->response.headers.guard = GUARD_IMMUTABLE;
+
+    fetch->response_value = JS_NewObjectClass(fetch->cx,
+                                              NGX_QJS_CLASS_ID_FETCH_RESPONSE);
+    if (JS_IsException(fetch->response_value)) {
+        ngx_qjs_fetch_error(cb, "fetch response creation failed");
+        return;
+    }
+
+    JS_SetOpaque(fetch->response_value, &fetch->response);
+
+    ngx_qjs_fetch_done(fetch, fetch->response_value, NGX_OK);
+}
+
+#else /* !NJS_USE_NGINX_HTTP_CLIENT */
 
 static void
 ngx_qjs_fetch_process_done(ngx_js_http_t *http)
@@ -1331,6 +1746,8 @@ ngx_qjs_fetch_process_done(ngx_js_http_t *http)
 
     ngx_qjs_fetch_done(fetch, fetch->response_value, NGX_OK);
 }
+
+#endif /* NJS_USE_NGINX_HTTP_CLIENT */
 
 
 static ngx_int_t
